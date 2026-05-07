@@ -1,0 +1,36 @@
+# Mega-cap tech
+NVDA
+TSLA
+AAPL
+MSFT
+GOOGL
+META
+AMZN
+AMD
+AVGO
+NFLX
+ORCL
+CRM
+ADBE
+
+# High-vol single names
+MSTR
+COIN
+PLTR
+SHOP
+UBER
+SNOW
+CRWD
+
+# Defensive / blue-chip
+JPM
+BAC
+WMT
+JNJ
+XOM
+CVX
+
+# ETFs
+SPY
+QQQ
+IWM

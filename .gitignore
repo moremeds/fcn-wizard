@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+outputs/
+node_modules/
+test-results/
+playwright-report/
+.pytest_cache/
+.DS_Store
+*.egg-info/
+
+fcn_candidates_*.csv
+fcn_pairs_*.csv

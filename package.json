@@ -1,0 +1,19 @@
+{
+  "name": "fcn-wizard",
+  "version": "1.0.0",
+  "description": "Small IBKR-based toolkit for screening Fixed Coupon Note underlyings.",
+  "main": "index.js",
+  "scripts": {
+    "test": "playwright test",
+    "test:e2e": "playwright test tests/streamlit-e2e.spec.ts",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
+  }
+}
