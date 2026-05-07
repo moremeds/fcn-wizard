@@ -27,18 +27,28 @@ Usage:
   python fcn_pair_screener.py
 """
 
-import glob
 import logging
-import os
 import sys
+import argparse
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from itertools import combinations
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 from ib_insync import IB, Stock, util
+
+SRC_DIR = Path(__file__).resolve().parent / "src"
+if SRC_DIR.exists():
+    sys.path.insert(0, str(SRC_DIR))
+
+from fcn_wizard.analysis import TickerMetrics, analyze_basket
+from fcn_wizard.config import ProductConfig
+from fcn_wizard.metrics import coupon_uplift_proxy, joint_ki_prob_mc, pair_correlation, single_name_ki_prob
+from fcn_wizard.run_storage import load_latest_table, save_run_table
+from fcn_wizard.scoring import score_pair as score_pair_with_breakdown
 
 
 # ============================================================
@@ -48,6 +58,7 @@ from ib_insync import IB, Stock, util
 IB_HOST = "127.0.0.1"
 IB_PORT = 7497
 IB_CLIENT_ID = 43
+OUTPUT_DIR = "outputs"
 
 # Used only if no fcn_candidates_*.csv found in cwd
 UNIVERSE_FALLBACK = [
@@ -77,8 +88,16 @@ log = logging.getLogger("fcn_pair_screener")
 # LOAD CANDIDATES
 # ============================================================
 
-def load_candidates() -> pd.DataFrame:
-    files = sorted(glob.glob("fcn_candidates_*.csv"))
+def load_candidates(input_dir: str | Path = OUTPUT_DIR) -> pd.DataFrame:
+    loaded = load_latest_table(output_dir=input_dir, kind="candidates")
+    if loaded is not None:
+        df, record = loaded
+        log.info(f"Loading candidates from run history {record.artifact_path}")
+        return _top_candidates(df)
+
+    files = sorted(Path(input_dir).glob("fcn_candidates_*.csv"))
+    if not files:
+        files = sorted(Path(".").glob("fcn_candidates_*.csv"))
     if not files:
         log.warning("No fcn_candidates_*.csv found — using UNIVERSE_FALLBACK")
         return pd.DataFrame({
@@ -90,7 +109,10 @@ def load_candidates() -> pd.DataFrame:
     latest = files[-1]
     log.info(f"Loading candidates from {latest}")
     df = pd.read_csv(latest)
+    return _top_candidates(df)
 
+
+def _top_candidates(df: pd.DataFrame) -> pd.DataFrame:
     # Take top-N by score (or all if fewer)
     df = df.sort_values("score", ascending=False).head(TOP_N_FROM_CSV)
     keep = ["symbol", "score"]
@@ -132,102 +154,6 @@ def fetch_returns(ib: IB, symbol: str, days: int) -> Optional[pd.Series]:
 
 
 # ============================================================
-# CORRELATION & STABILITY
-# ============================================================
-
-def pair_correlation(r1: pd.Series, r2: pd.Series, window: int = 60):
-    """Returns (current_corr_60d, full_corr, rolling_corr_std)."""
-    df = pd.concat([r1, r2], axis=1).dropna()
-    if len(df) < window + 30:
-        return None, None, None
-    full = df.iloc[:, 0].corr(df.iloc[:, 1])
-    rolling = df.iloc[:, 0].rolling(window).corr(df.iloc[:, 1]).dropna()
-    if rolling.empty:
-        return None, full, None
-    current = float(rolling.iloc[-1])
-    stability = float(rolling.std())
-    return current, float(full), stability
-
-
-# ============================================================
-# MONTE CARLO JOINT KI
-# ============================================================
-
-def joint_ki_prob_mc(
-    vol_a: float, vol_b: float, rho: float,
-    barrier: float = KI_BARRIER, days: int = TENOR_DAYS,
-    n_sims: int = N_MC_SIMS, seed: int = RNG_SEED,
-) -> tuple[float, float, float]:
-    """
-    Returns (P_either_hits, P_both_hit, P_only_one). Uses GBM with zero
-    drift (risk-neutral approximation, dropping rates for screening).
-    """
-    rng = np.random.default_rng(seed)
-    dt = 1.0 / 252.0
-    n_steps = days
-
-    cov = np.array([[1.0, rho], [rho, 1.0]])
-    try:
-        L = np.linalg.cholesky(cov)
-    except np.linalg.LinAlgError:
-        # rho out of range
-        rho = max(min(rho, 0.999), -0.999)
-        cov = np.array([[1.0, rho], [rho, 1.0]])
-        L = np.linalg.cholesky(cov)
-
-    z = rng.standard_normal(size=(n_sims, n_steps, 2))
-    z = z @ L.T  # correlated normals
-
-    drift_a = -0.5 * vol_a ** 2 * dt
-    drift_b = -0.5 * vol_b ** 2 * dt
-    diff_a = drift_a + vol_a * np.sqrt(dt) * z[:, :, 0]
-    diff_b = drift_b + vol_b * np.sqrt(dt) * z[:, :, 1]
-
-    log_path_a = np.cumsum(diff_a, axis=1)
-    log_path_b = np.cumsum(diff_b, axis=1)
-    min_a = np.exp(log_path_a.min(axis=1))
-    min_b = np.exp(log_path_b.min(axis=1))
-
-    hit_a = min_a <= barrier
-    hit_b = min_b <= barrier
-    p_either = float((hit_a | hit_b).mean())
-    p_both = float((hit_a & hit_b).mean())
-    p_one = p_either - p_both
-    return p_either, p_both, p_one
-
-
-def single_name_ki_prob(vol: float, barrier: float = KI_BARRIER,
-                        days: int = TENOR_DAYS) -> float:
-    """Closed-form continuous barrier hit probability under GBM (no drift)."""
-    if vol is None or vol <= 0:
-        return float("nan")
-    sigma_T = vol * np.sqrt(days / 252.0)
-    if sigma_T == 0:
-        return 0.0
-    log_b = np.log(barrier)
-    # GBM no-drift: P(min S_t <= B) = 2 * N(log(B) / sigma_T)
-    from scipy.stats import norm
-    return 2.0 * norm.cdf(log_b / sigma_T)
-
-
-# ============================================================
-# COUPON UPLIFT ESTIMATE
-# ============================================================
-
-def coupon_uplift_proxy(p_ki_single_a: float, p_ki_single_b: float,
-                        p_ki_pair: float) -> float:
-    """
-    Proxy for coupon uplift: ratio of pair KI prob over the better
-    (lower-risk) single name. >1 means pair is riskier and should pay
-    more coupon. Useful for ranking.
-    """
-    best_single = min(p_ki_single_a, p_ki_single_b)
-    if best_single <= 0:
-        return float("nan")
-    return p_ki_pair / best_single
-
-
-# ============================================================
 # SCORING
 # ============================================================
 
@@ -251,58 +177,35 @@ class PairMetrics:
 
 
 def score_pair(p: PairMetrics) -> float:
-    s = (p.score_a + p.score_b) / 2.0  # base = average of single-name scores
-
-    # Correlation: higher is better for investor (less dispersion = lower joint KI)
-    if p.corr_60d is not None:
-        if p.corr_60d > 0.7:
-            s += 1.5
-        elif p.corr_60d > 0.5:
-            s += 1.0
-        elif p.corr_60d > 0.3:
-            s += 0.0
-        else:
-            s -= 1.0  # low corr = nasty worst-of for investor
-
-    # Correlation stability — penalize regime-shift pairs
-    if p.corr_stability is not None:
-        if p.corr_stability < 0.10:
-            s += 0.5
-        elif p.corr_stability > 0.20:
-            s -= 0.5
-
-    # Joint KI penalty (absolute level)
-    if p.p_ki_either is not None:
-        if p.p_ki_either < 0.15:
-            s += 1.5
-        elif p.p_ki_either < 0.30:
-            s += 0.5
-        elif p.p_ki_either > 0.50:
-            s -= 1.5
-
-    # Coupon uplift sweet spot: 1.3-1.8x = good (worth the extra risk)
-    if p.coupon_uplift is not None:
-        if 1.2 < p.coupon_uplift < 1.8:
-            s += 0.5
-        elif p.coupon_uplift > 2.5:
-            s -= 0.5
-
-    return round(s, 2)
+    total, _ = score_pair_with_breakdown(asdict(p))
+    return total
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def main():
-    candidates = load_candidates()
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Rank worst-of FCN pairs using the latest single-name run.")
+    parser.add_argument("--host", default=IB_HOST)
+    parser.add_argument("--port", type=int, default=IB_PORT)
+    parser.add_argument("--client-id", type=int, default=IB_CLIENT_ID)
+    parser.add_argument("--input-dir", default=OUTPUT_DIR, help="Directory containing run history or dated candidate CSVs.")
+    parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Directory where pair run history is stored.")
+    parser.add_argument("--basket-size", type=int, choices=[2, 3], default=2)
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[list[str]] = None):
+    args = parse_args(argv)
+    candidates = load_candidates(args.input_dir)
     log.info(f"Working with {len(candidates)} candidates")
     log.info(f"\n{candidates.to_string(index=False)}\n")
 
     ib = IB()
-    log.info(f"Connecting to IB {IB_HOST}:{IB_PORT}...")
+    log.info(f"Connecting to IB {args.host}:{args.port}...")
     try:
-        ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID, timeout=15)
+        ib.connect(args.host, args.port, clientId=args.client_id, timeout=15)
     except Exception as e:
         log.error(f"IB connection failed: {e}")
         sys.exit(1)
@@ -324,12 +227,18 @@ def main():
     ib.disconnect()
     log.info(f"Got returns for {len(returns)} names")
 
-    # Build IV map
+    # Build vol and score maps
     iv_map: dict[str, float] = {}
+    rv_map: dict[str, float] = {}
     if "iv_30d_current" in candidates.columns:
         for _, row in candidates.iterrows():
             iv = row["iv_30d_current"]
             iv_map[row["symbol"]] = float(iv) if pd.notna(iv) else DEFAULT_VOL
+    if "rv_30d" in candidates.columns:
+        for _, row in candidates.iterrows():
+            rv = row["rv_30d"]
+            if pd.notna(rv):
+                rv_map[row["symbol"]] = float(rv)
     score_map = dict(zip(candidates["symbol"], candidates["score"]))
 
     # Single-name KI probs (cache)
@@ -338,75 +247,138 @@ def main():
         for s in returns.keys()
     }
 
-    # Iterate pairs
-    log.info("\nComputing pair metrics...")
-    results: list[PairMetrics] = []
+    # Iterate pairs or triples
+    log.info("\nComputing basket metrics...")
     syms = list(returns.keys())
-    pairs = list(combinations(syms, 2))
-    log.info(f"Total pairs: {len(pairs)}")
+    baskets = list(combinations(syms, args.basket_size))
+    log.info(f"Total baskets: {len(baskets)}")
 
-    for k, (a, b) in enumerate(pairs):
-        if (k + 1) % 20 == 0:
-            log.info(f"  pair {k+1}/{len(pairs)}")
+    if args.basket_size == 2:
+        results: list[PairMetrics] = []
+        for k, (a, b) in enumerate(baskets):
+            if (k + 1) % 20 == 0:
+                log.info(f"  pair {k+1}/{len(baskets)}")
 
-        cur_corr, full_corr, stab = pair_correlation(returns[a], returns[b])
-        if cur_corr is None:
-            continue
+            cur_corr, full_corr, stab = pair_correlation(returns[a], returns[b])
+            if cur_corr is None:
+                continue
 
-        vol_a = iv_map.get(a, DEFAULT_VOL)
-        vol_b = iv_map.get(b, DEFAULT_VOL)
+            vol_a = iv_map.get(a, DEFAULT_VOL)
+            vol_b = iv_map.get(b, DEFAULT_VOL)
 
-        try:
-            p_either, p_both, _ = joint_ki_prob_mc(
-                vol_a, vol_b, cur_corr,
-                barrier=KI_BARRIER, days=TENOR_DAYS,
-                n_sims=N_MC_SIMS, seed=RNG_SEED,
+            try:
+                p_either, p_both, _ = joint_ki_prob_mc(
+                    vol_a, vol_b, cur_corr,
+                    barrier=KI_BARRIER, days=TENOR_DAYS,
+                    n_sims=N_MC_SIMS, seed=RNG_SEED,
+                )
+            except Exception as e:
+                log.warning(f"  MC failed for ({a},{b}): {e}")
+                continue
+
+            pm = PairMetrics(
+                a=a, b=b,
+                score_a=float(score_map.get(a, 0.0)),
+                score_b=float(score_map.get(b, 0.0)),
+                iv_a=vol_a, iv_b=vol_b,
+                corr_60d=cur_corr, corr_full=full_corr, corr_stability=stab,
+                p_ki_a=single_ki.get(a),
+                p_ki_b=single_ki.get(b),
+                p_ki_either=p_either, p_ki_both=p_both,
+                coupon_uplift=coupon_uplift_proxy(
+                    single_ki.get(a, 0.0), single_ki.get(b, 0.0), p_either
+                ),
             )
-        except Exception as e:
-            log.warning(f"  MC failed for ({a},{b}): {e}")
-            continue
+            pm.pair_score = score_pair(pm)
+            results.append(pm)
+        df = pd.DataFrame([asdict(r) for r in results])
+        score_column = "pair_score"
+        output_kind = "pairs"
+        output_label = "pairs"
+        filename_prefix = "fcn_pairs"
+    else:
+        product = ProductConfig(tenor_days=TENOR_DAYS, ki_barrier=KI_BARRIER)
+        basket_results: list[dict] = []
+        for k, symbols in enumerate(baskets):
+            if (k + 1) % 20 == 0:
+                log.info(f"  basket {k+1}/{len(baskets)}")
+            rows = [
+                TickerMetrics(
+                    symbol=symbol,
+                    score=float(score_map.get(symbol, 0.0)),
+                    iv_30d_current=iv_map.get(symbol, DEFAULT_VOL),
+                    rv_30d=rv_map.get(symbol),
+                )
+                for symbol in symbols
+            ]
+            try:
+                basket_row, _ = analyze_basket(rows, returns, product, window=60, n_sims=N_MC_SIMS)
+            except Exception as e:
+                log.warning(f"  basket analysis failed for {symbols}: {e}")
+                continue
+            basket_results.append(basket_row)
+        df = pd.DataFrame(basket_results)
+        score_column = "basket_score"
+        output_kind = "baskets"
+        output_label = "baskets"
+        filename_prefix = "fcn_baskets"
 
-        pm = PairMetrics(
-            a=a, b=b,
-            score_a=float(score_map.get(a, 0.0)),
-            score_b=float(score_map.get(b, 0.0)),
-            iv_a=vol_a, iv_b=vol_b,
-            corr_60d=cur_corr, corr_full=full_corr, corr_stability=stab,
-            p_ki_a=single_ki.get(a),
-            p_ki_b=single_ki.get(b),
-            p_ki_either=p_either, p_ki_both=p_both,
-            coupon_uplift=coupon_uplift_proxy(
-                single_ki.get(a, 0.0), single_ki.get(b, 0.0), p_either
-            ),
-        )
-        pm.pair_score = score_pair(pm)
-        results.append(pm)
+    if df.empty:
+        log.error("No basket results produced.")
+        sys.exit(1)
 
     # Output
-    df = pd.DataFrame([asdict(r) for r in results])
-    df = df.sort_values("pair_score", ascending=False).reset_index(drop=True)
+    df = df.sort_values(score_column, ascending=False).reset_index(drop=True)
 
     today = datetime.today().strftime("%Y%m%d")
-    out_path = f"fcn_pairs_{today}.csv"
+    out_path = f"{filename_prefix}_{today}.csv"
     df.to_csv(out_path, index=False)
-    log.info(f"Saved {len(df)} pairs → {out_path}")
+    log.info(f"Saved {len(df)} {output_label} → {out_path}")
+    run_record = save_run_table(
+        df,
+        output_dir=args.output_dir,
+        kind=output_kind,
+        metadata={
+            "host": args.host,
+            "port": args.port,
+            "client_id": args.client_id,
+            "input_dir": args.input_dir,
+            "dated_output": out_path,
+            "basket_size": args.basket_size,
+            "top_n_from_csv": TOP_N_FROM_CSV,
+            "lookback_days": LOOKBACK_DAYS,
+            "ki_barrier": KI_BARRIER,
+            "tenor_days": TENOR_DAYS,
+            "n_mc_sims": N_MC_SIMS,
+        },
+    )
+    log.info(f"Saved {output_label} run history → {run_record.artifact_path}")
 
-    cols = [
-        "a", "b", "score_a", "score_b", "iv_a", "iv_b",
-        "corr_60d", "corr_stability",
-        "p_ki_a", "p_ki_b", "p_ki_either", "p_ki_both",
-        "coupon_uplift", "pair_score",
-    ]
+    if args.basket_size == 2:
+        cols = [
+            "a", "b", "score_a", "score_b", "iv_a", "iv_b",
+            "corr_60d", "corr_stability",
+            "p_ki_a", "p_ki_b", "p_ki_either", "p_ki_both",
+            "coupon_uplift", "pair_score",
+        ]
+        title = "TOP 15 WORST-OF FCN PAIRS"
+    else:
+        cols = [
+            "symbols", "score_avg", "corr_avg", "corr_stability",
+            "p_ki_either", "p_ki_all", "fair_coupon_proxy", "basket_score",
+        ]
+        title = "TOP 15 WORST-OF FCN BASKETS"
     cols = [c for c in cols if c in df.columns]
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", 220)
     pd.set_option("display.float_format", lambda x: f"{x:.3f}")
     print("\n" + "=" * 90)
-    print("TOP 15 WORST-OF FCN PAIRS")
+    print(title)
     print("=" * 90)
     print(df[cols].head(15).to_string(index=False))
     print("=" * 90)
-    print(f"""
+    if args.basket_size == 2:
+        print(f"""
 Reading the columns:
   corr_60d        : 60-day rolling correlation (current)
   corr_stability  : std of rolling 60d correlation (lower = more stable regime)
@@ -416,6 +388,16 @@ Reading the columns:
   coupon_uplift   : p_ki_either / min(p_ki_a, p_ki_b)
                     >1 means pair is riskier than safer single name
   pair_score      : combined screener score (higher = more attractive)
+""")
+    else:
+        print(f"""
+Reading the columns:
+  corr_avg        : average pairwise correlation across the basket
+  corr_stability  : average std of rolling pairwise correlation
+  p_ki_either     : MC P(at least one name hits 50% KI in 1Y)
+  p_ki_all        : MC P(all names hit 50% KI in 1Y)
+  fair_coupon_proxy: annualized model fair coupon proxy for the basket
+  basket_score    : combined screener score (higher = more attractive)
 """)
 
 

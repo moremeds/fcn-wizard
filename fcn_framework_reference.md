@@ -1,7 +1,7 @@
 # FCN Screening Framework — 完整技术参考
 
 > 给 APEX FCN screener 的配套文档:产品定义、payoff 分解、定价模型、风险度量、Screener 架构、扩展路线图。
-> 配套脚本:`fcn_screener.py`(单票),`fcn_pair_screener.py`(worst-of pair)。
+> 配套脚本:`fcn_screener.py`(单票),`fcn_pair_screener.py`(worst-of pair),`fair_coupon.py`(PB quote vs fair coupon)。
 
 ---
 
@@ -138,7 +138,9 @@ $$P_{DIP} = S_0 \!\left[\Phi(d_1) - \left(\frac{B}{S_0}\right)^{2} \Phi(d_3)\rig
 
 (完整 Reiner-Rubinstein 公式有八种 in/out × call/put × strike 位置,这里给的是 strike 在 barrier 之上的 down-and-in put 简化版本)
 
-实践中 FCN 的 DIP 用 closed form 已经足够 screening,production booking 用 PDE 或 local vol MC。
+实践中 FCN 的 DIP 用 closed form 已经足够 screening,production booking 用 PDE 或 local vol MC。当前代码提供两层:
+- `down_in_put_proxy`: 用 KI touch probability × 条件损失的稳定 screening proxy。
+- `down_in_put_rr`: 先通过 vanilla bound / barrier edge-case invariant tests 的 gated function,暂不进入 score 排名;后续需要用外部 reference cases 完成公式级校验后再替换 proxy。
 
 ### 3.4 期望 KI 损失(条件 + 无条件)
 
@@ -188,7 +190,12 @@ $$\boxed{C_{\text{fair}} \approx \frac{P(KI) \cdot E[\text{Loss}|KI]}{E[\text{mo
 2. Skew 已经把 OTM put 卖贵了,dealer hedge 成本低于 closed-form
 3. Dealer 主动定价让 PV 给客户负 5–8%(margin)
 
-**Screener 应该输出 implied fair coupon 与报价 coupon 的差,作为定性指标。**
+**Screener 输出 implied fair coupon 与报价 coupon 的差,作为定性指标。**
+
+本项目的符号约定:
+$$\boxed{\text{dealer\_margin} = C_{\text{fair}} - C_{\text{quoted}}}$$
+
+因此 `dealer_margin > 0` 表示模型 fair coupon 高于 PB 报价,客户在 coupon 上被 underpaid;值越大,越像 PB / dealer 把经济价值拿走。`dealer_margin < 0` 表示 PB 报价比模型 fair value 更高,需要再检查输入假设和 quote 条款是否一致。
 
 ---
 
@@ -356,8 +363,22 @@ $$\text{Coupon Uplift} = \frac{P(\text{worst-of either KI})}{\min(P(KI_a), P(KI_
 fcn_screener/
 ├── fcn_screener.py              # 单票 screener
 ├── fcn_pair_screener.py         # Worst-of pair screener
-├── fcn_candidates_YYYYMMDD.csv  # screener 1 输出
-└── fcn_pairs_YYYYMMDD.csv       # screener 2 输出
+├── fair_coupon.py               # PB quote vs model fair coupon
+├── app/streamlit_app.py         # 交互式 dashboard
+├── src/fcn_wizard/
+│   ├── analytics/               # metrics / scoring / analysis
+│   ├── data/                    # IBKR data adapter
+│   ├── storage/                 # run history persistence
+│   ├── workflows/               # bootstrap / fair coupon workflows
+│   └── quotes/                  # PB quote normalization / comparison
+├── outputs/
+│   ├── fcn_candidates_YYYYMMDD.csv
+│   ├── run_index.csv
+│   └── runs/RUN_ID/
+│       ├── candidates.csv       # 可 reload 的单票结果
+│       ├── pairs.csv            # 可 reload 的 pair 结果(如已运行)
+│       └── metadata.json        # run config / product assumptions
+└── fcn_pairs_YYYYMMDD.csv       # legacy pair screener 输出(兼容旧 workflow)
 ```
 
 ### 7.2 数据流
@@ -375,17 +396,29 @@ fcn_screener.py
     │ - per-ticker metric computation
     │ - heuristic scoring
     ▼
-fcn_candidates_YYYYMMDD.csv
+outputs/fcn_candidates_YYYYMMDD.csv
+outputs/runs/RUN_ID/candidates.csv + outputs/run_index.csv
     │
     ▼
-fcn_pair_screener.py (auto-loads latest CSV)
+fcn_pair_screener.py (优先 auto-load run history;其次 dated CSV)
     │ - re-fetch returns from IB
     │ - rolling correlation
     │ - Cholesky MC for joint KI
     │ - pair scoring
     ▼
 fcn_pairs_YYYYMMDD.csv
+outputs/runs/RUN_ID/pairs.csv
+    │
+    ▼
+fair_coupon.py
+    │ - read latest pairs or --pairs-file
+    │ - read PB quote CSV: pb,symbols,quoted_coupon
+    │ - compute dealer_margin = fair_coupon - quoted_coupon
+    ▼
+outputs/fair_coupon_quotes.csv
 ```
+
+Dashboard 启动时会先尝试读取 `outputs/run_index.csv` 指向的最新 `candidates.csv`;如果不存在,才按 `config/default_universe.txt` 跑一轮。手动 **Load latest saved run** 也直接读取 run history,不需要重新连接 IBKR。
 
 ### 7.3 关键 module 边界
 
@@ -395,7 +428,11 @@ fcn_pairs_YYYYMMDD.csv
 | Metric computation | `iv_rank`, `realized_vol`, `pair_correlation`, … | 纯函数,易测试 |
 | Pricing engine | `single_name_ki_prob`, `joint_ki_prob_mc` | 纯数学 |
 | Scoring | `score`, `score_pair` | 业务逻辑,可调参 |
-| Pipeline orchestration | `screen_ticker`, `main` | I/O + 协调 |
+| Run storage | `src/fcn_wizard/storage/run_storage.py` | 保存 / reload `outputs/runs/RUN_ID/*.csv` |
+| Bootstrap workflow | `src/fcn_wizard/workflows/bootstrap.py` | latest-run 自动加载;无历史时 fallback 到默认 universe |
+| Fair coupon workflow | `src/fcn_wizard/workflows/fair_coupon.py` | pair fair coupon 与 PB quote 对比 |
+| Quote import | `src/fcn_wizard/quotes/pb_quotes.py` | PB quote symbols 标准化 / merge |
+| Pipeline orchestration | `screen_ticker`, `main`, `workflows/*` | I/O + 协调 |
 
 **这个分层让你扩展时只需要碰对应 module。**
 
@@ -406,17 +443,32 @@ fcn_pairs_YYYYMMDD.csv
 - 50 个标的全跑 ~5–8 分钟(含 skew 抓取);关闭 skew 后 ~2 分钟
 - MC 部分:N=15 时 105 对,每对 20K paths 约 0.3s,总 ~30s
 
+### 7.5 当前已实现 workflow 状态
+
+| Workflow | 状态 | Caveat |
+|---|---|---|
+| Run history / auto bootstrap | 已实现 | Dashboard 先 load latest;无历史才跑 `config/default_universe.txt` |
+| Fair coupon proxy | 已实现 | 仍是 screening proxy,不是 booking PV |
+| Dealer margin | 已实现 | `dealer_margin = fair_coupon - quoted_coupon`;正值 = PB quote 对客户偏差 |
+| Standalone fair coupon compare | 已实现 | `fair_coupon.py --quotes-file quotes.csv` |
+| 3-name worst-of basket | 已实现 | `fcn_pair_screener.py --basket-size 3`;dashboard 支持 Leg C |
+| Tenor IV selector | 已实现 | 需要 option chain / OPRA;无数据时 fallback 到 30D IV / RV |
+| SVI downside wing vol | 已实现基础版 | live surface sample 受 IBKR option data 和 pacing 限制 |
+| Point-in-time replay backtest | 已实现基础版 | 历史 skew/option chain 不用 IBKR 重放;如需 skew 用 Polygon 等外部 provider |
+| PB quote comparison | 已实现 | Dashboard CSV upload + package `quotes` module |
+| DuckDB snapshot store | 已实现 opt-in | 只用于 prospective monitoring,不是 calibration 必需 |
+
 ---
 
 ## 8. 扩展路线图
 
 ### 8.1 短期(1–2 周)
 
-#### A. 3-name basket screener
-当前只做 pair。HK PB 越来越多用 3-name worst-of。改动点:
-- `fcn_pair_screener.py` 的 `combinations(syms, 2)` → `combinations(syms, 3)`
-- `joint_ki_prob_mc` 改成 generic n-asset(传入 cov matrix 和 vol vector)
-- N=15 → 455 triples,MC 时间 ~3 分钟,可接受
+#### A. 3-name basket screener(已实现基础版)
+HK PB 越来越多用 3-name worst-of。当前实现:
+- `fcn_pair_screener.py --basket-size 2|3`
+- `joint_ki_prob_nd` 支持 generic n-asset(传入 corr matrix 和 vol vector)
+- Dashboard 支持 Leg A / B / C 选择
 
 ```python
 def joint_ki_prob_nd(vols, cov_matrix, barrier=0.5, days=252, n_sims=20_000):
@@ -432,23 +484,30 @@ def joint_ki_prob_nd(vols, cov_matrix, barrier=0.5, days=252, n_sims=20_000):
     return float((min_per_asset <= barrier).any(axis=1).mean())
 ```
 
-#### B. 隐含 fair coupon 反推
-新增 module `fair_coupon.py`:
+#### B. 隐含 fair coupon 反推(已实现基础版)
+当前 dashboard package 已有 `src/fcn_wizard/metrics.py:fair_coupon_proxy`,公式如下:
 ```python
-def implied_fair_coupon(p_ki, expected_loss_given_ki, expected_alive_months,
-                       discount_rate=0.045):
+def fair_coupon_proxy(p_ki, expected_loss_given_ki, expected_alive_months,
+                      discount_rate=0.045, tenor_years=1.0):
     """Returns annualized fair coupon based on risk-neutral pricing."""
-    pv_dip = p_ki * expected_loss_given_ki * np.exp(-discount_rate * 1.0)
+    pv_dip = p_ki * expected_loss_given_ki * np.exp(-discount_rate * tenor_years)
     annualized = pv_dip / (expected_alive_months / 12.0)
     return annualized
 ```
-然后输出 column `dealer_margin = quoted_coupon - fair_coupon`,直接对照 PB 报价单。
+当前 standalone CSV 与 dashboard 均输出 `p_ki` / `fair_coupon_proxy`;`fcn_screener.py --quoted-coupon 0.22` 和 dashboard sidebar 可写入 `quoted_coupon`。统一输出:
 
-#### C. 完整 IV surface 替代单点 IV
-当前用 30D IV 做所有计算,实际 FCN 是 1Y 产品。改动:
-- 加 `fetch_iv_term_structure` 拿 1M / 3M / 6M / 12M IV
-- KI 概率用 1Y IV 而非 30D IV
-- 这一步会让 screener 数值显著更准
+```text
+dealer_margin = fair_coupon_proxy - quoted_coupon
+```
+
+Root-level `fair_coupon.py` 可读取 latest saved pair run 或 `--pairs-file`,再读取 PB quote CSV(`pb,symbols,quoted_coupon`),输出 ranked `fair_coupon / dealer_margin / verdict`。剩余改进是把 proxy 升级为更完整的 autocall-aware MC / DIP 定价。
+
+#### C. Tenor IV / IV surface 替代单点 IV(基础版已实现)
+当前默认仍可用 30D IV,但 package/dashboard 已支持两个更准的层:
+- `fetch_atm_iv_for_dte`:拿最接近 tenor 的 ATM option IV,用 `choose_tenor_vol` 优先级 `tenor_iv → 30D IV → RV`
+- `fetch_option_surface_sample` + SVI:用 downside wing moneyness 估计 `surface_ki_vol`
+
+Caveat:live tenor IV / surface fitting 都需要 option chain + OPRA market data;历史 replay 时 IBKR historical option chain/skew 不完整,不要把 no-skew replay 误解为 skew-calibrated backtest。
 
 ### 8.2 中期(1 月)
 

@@ -14,6 +14,7 @@ dependencies = [
   "pandas",
   "scipy",
   "streamlit",
+  "duckdb",
 ]
 
 [tool.setuptools.packages.find]

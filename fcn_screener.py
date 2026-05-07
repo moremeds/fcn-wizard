@@ -37,6 +37,24 @@ import numpy as np
 import pandas as pd
 from ib_insync import IB, Stock, Option, util
 
+SRC_DIR = Path(__file__).resolve().parent / "src"
+if SRC_DIR.exists():
+    sys.path.insert(0, str(SRC_DIR))
+
+from fcn_wizard.metrics import (
+    above_200dma,
+    dealer_margin,
+    drawdown_3m,
+    fair_coupon_proxy,
+    iv_rank,
+    max_drawdown,
+    realized_vol,
+    single_name_ki_prob,
+    stock_adv_usd,
+)
+from fcn_wizard.run_storage import load_latest_table, save_run_table
+from fcn_wizard.scoring import score_single
+
 
 # ============================================================
 # CONFIG
@@ -100,6 +118,10 @@ class TickerMetrics:
     max_drawdown_5y: Optional[float] = None     # worst 5Y peak-to-trough
     crash_5y: Optional[int] = None              # 1 if any >=50% drawdown in 5Y
     stock_adv_usd: Optional[float] = None       # liquidity proxy
+    p_ki: Optional[float] = None
+    fair_coupon_proxy: Optional[float] = None
+    quoted_coupon: Optional[float] = None
+    dealer_margin: Optional[float] = None
     score: float = 0.0
     notes: str = ""
 
@@ -226,112 +248,6 @@ def fetch_skew(ib: IB, symbol: str, target_dte: int, target_delta: float):
 
 
 # ============================================================
-# METRICS
-# ============================================================
-
-def iv_rank(iv_series: pd.Series) -> Optional[float]:
-    if iv_series is None or len(iv_series) < 30:
-        return None
-    cur = iv_series.iloc[-1]
-    lo, hi = float(iv_series.min()), float(iv_series.max())
-    if hi == lo:
-        return 50.0
-    return (cur - lo) / (hi - lo) * 100
-
-
-def realized_vol(prices: pd.Series, window: int = 30) -> Optional[float]:
-    if prices is None or len(prices) < window + 1:
-        return None
-    log_ret = np.log(prices / prices.shift(1)).dropna()
-    return float(log_ret.tail(window).std() * np.sqrt(252))
-
-
-def drawdown_3m(prices: pd.Series) -> Optional[float]:
-    if prices is None or len(prices) < 60:
-        return None
-    recent = prices.tail(63)
-    return float(recent.iloc[-1] / recent.max() - 1.0)
-
-
-def max_drawdown(prices: pd.Series) -> Optional[float]:
-    if prices is None or len(prices) < 100:
-        return None
-    rolling_max = prices.cummax()
-    dd = prices / rolling_max - 1.0
-    return float(dd.min())
-
-
-def above_200dma(prices: pd.Series) -> Optional[bool]:
-    if prices is None or len(prices) < 200:
-        return None
-    sma = prices.tail(200).mean()
-    return bool(prices.iloc[-1] > sma)
-
-
-def stock_adv_usd(df_history: pd.DataFrame, days: int = 20) -> Optional[float]:
-    if df_history is None or df_history.empty:
-        return None
-    sub = df_history.tail(days)
-    if "volume" not in sub.columns or "close" not in sub.columns:
-        return None
-    return float((sub["close"] * sub["volume"]).mean())
-
-
-# ============================================================
-# SCORING
-# ============================================================
-
-def score(m: TickerMetrics) -> float:
-    s = 0.0
-
-    # IV rank — high vol = high coupon
-    if m.iv_rank is not None:
-        if m.iv_rank > 70:
-            s += 2.0
-        elif m.iv_rank > 50:
-            s += 1.0
-        elif m.iv_rank < 25:
-            s -= 0.5
-
-    # VRP — IV expensive vs RV is what dealer is selling
-    if m.vrp is not None:
-        if m.vrp > 0.05:
-            s += 2.0
-        elif m.vrp > 0.02:
-            s += 1.0
-        elif m.vrp < -0.02:
-            s -= 1.0
-
-    # Skew sweet spot
-    if m.put_skew_25d is not None:
-        if 0.02 < m.put_skew_25d < 0.08:
-            s += 1.0
-        elif m.put_skew_25d > 0.10:
-            s -= 1.0  # extreme skew = dealer pricing in big tail
-
-    # Trend
-    if m.above_200dma:
-        s += 1.0
-    if m.drawdown_3m is not None and m.drawdown_3m > -0.15:
-        s += 0.5
-
-    # Liquidity (stock $ ADV proxy)
-    if m.stock_adv_usd is not None:
-        if m.stock_adv_usd > 1e9:
-            s += 1.0
-        elif m.stock_adv_usd > 2e8:
-            s += 0.5
-
-    # Historical KI safety
-    if m.crash_5y == 0:
-        s += 2.0
-    elif m.crash_5y == 1:
-        s -= 1.0
-
-    return round(s, 2)
-
-
-# ============================================================
 # PER-TICKER PIPELINE
 # ============================================================
 
@@ -340,6 +256,7 @@ def screen_ticker(
     symbol: str,
     fetch_skew_enabled: bool = FETCH_SKEW,
     raw_dir: Optional[Path] = None,
+    quoted_coupon: Optional[float] = None,
 ) -> TickerMetrics:
     m = TickerMetrics(symbol=symbol)
     try:
@@ -389,7 +306,14 @@ def screen_ticker(
             except Exception as e:
                 log.warning(f"{symbol} skew failed: {e}")
 
-        m.score = score(m)
+        vol_for_ki = m.iv_30d_current or m.rv_30d
+        if vol_for_ki:
+            m.p_ki = single_name_ki_prob(vol_for_ki, KI_THRESHOLD, LOOKBACK_DAYS_1Y)
+            m.fair_coupon_proxy = fair_coupon_proxy(m.p_ki)
+        m.quoted_coupon = quoted_coupon
+        m.dealer_margin = dealer_margin(quoted_coupon, m.fair_coupon_proxy)
+
+        m.score, _ = score_single(m)
 
     except Exception as e:
         log.exception(f"{symbol} pipeline failed")
@@ -415,6 +339,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default=OUTPUT_DIR)
     parser.add_argument("--save-raw", action=argparse.BooleanOptionalAction, default=SAVE_RAW_DATA)
     parser.add_argument("--fetch-skew", action=argparse.BooleanOptionalAction, default=FETCH_SKEW)
+    parser.add_argument("--auto-load-latest", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--force-refresh", action="store_true")
+    parser.add_argument("--quoted-coupon", type=float, default=None, help="Annualized quoted coupon as decimal, e.g. 0.22")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--batch-sleep", type=float, default=BATCH_SLEEP_SEC)
     parser.add_argument("--top", type=int, default=10, help="Rows to print to stdout.")
@@ -439,9 +366,20 @@ def main(argv: Optional[list[str]] = None):
         "skew_delta": SKEW_DELTA,
         "ki_threshold": KI_THRESHOLD,
         "fetch_skew": args.fetch_skew,
+        "quoted_coupon": args.quoted_coupon,
         "save_raw": args.save_raw,
     }
     (output_dir / "single_run_config.json").write_text(json.dumps(run_config, indent=2) + "\n")
+
+    if args.auto_load_latest and not args.force_refresh:
+        loaded = load_latest_table(output_dir=output_dir, kind="candidates")
+        if loaded is not None:
+            df, record = loaded
+            log.info(f"Loaded previous candidate run {record.run_id} from {record.artifact_path}")
+            pd.set_option("display.max_columns", None)
+            pd.set_option("display.width", 200)
+            print(df.head(args.top).to_string(index=False))
+            return
 
     ib = IB()
     log.info(f"Connecting to IB {args.host}:{args.port} (clientId={args.client_id})...")
@@ -458,7 +396,7 @@ def main(argv: Optional[list[str]] = None):
     for batch in chunked(universe, args.batch_size):
         for symbol in batch:
             log.info(f"  → {symbol}")
-            results.append(screen_ticker(ib, symbol, args.fetch_skew, raw_dir))
+            results.append(screen_ticker(ib, symbol, args.fetch_skew, raw_dir, args.quoted_coupon))
         log.info(f"Batch done; sleeping {args.batch_sleep}s for pacing...")
         ib.sleep(args.batch_sleep)
 
@@ -473,12 +411,19 @@ def main(argv: Optional[list[str]] = None):
     out_path = output_dir / f"fcn_candidates_{today}.csv"
     df.to_csv(out_path, index=False)
     log.info(f"\nSaved {len(df)} rows → {out_path}")
+    run_record = save_run_table(
+        df,
+        output_dir=output_dir,
+        kind="candidates",
+        metadata={**run_config, "dated_output": str(out_path)},
+    )
+    log.info(f"Saved run history → {run_record.artifact_path}")
 
     # Pretty print top 10
     cols = [
         "symbol", "spot", "iv_30d_current", "iv_rank", "rv_30d", "vrp",
-        "put_skew_25d", "above_200dma", "drawdown_3m", "max_drawdown_5y",
-        "crash_5y", "score",
+        "p_ki", "fair_coupon_proxy", "put_skew_25d", "above_200dma", "drawdown_3m", "max_drawdown_5y",
+        "quoted_coupon", "dealer_margin", "crash_5y", "score",
     ]
     cols = [c for c in cols if c in df.columns]
     pd.set_option("display.max_columns", None)
